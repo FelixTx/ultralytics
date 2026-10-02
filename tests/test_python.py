@@ -664,6 +664,56 @@ def test_tracktrack_new_lifecycle():
     assert tracker.tracked_stracks[0].state == TrackState.Tracked
 
 
+def test_kpttrack_keeps_ids():
+    """KPTTracker keeps IDs through a short hide and a left-right flipped detection, and needs a pose model."""
+    from types import SimpleNamespace
+
+    from ultralytics.engine.results import Boxes
+    from ultralytics.trackers.kpt_tracker import COCO_FLIP
+    from ultralytics.trackers.track import TRACKER_MAP
+    from ultralytics.utils import ROOT, YAML, IterableSimpleNamespace
+
+    standing = np.array(  # COCO keypoints of a person standing, 350 px tall
+        [[320, 80], [325, 75], [315, 75], [330, 80], [310, 80], [350, 130], [290, 130], [370, 190], [270, 190]]
+        + [[380, 250], [260, 250], [340, 270], [300, 270], [345, 350], [295, 350], [348, 430], [292, 430]],
+        dtype=np.float32,
+    )
+    tracker = TRACKER_MAP["kpttrack"](IterableSimpleNamespace(**YAML.load(ROOT / "cfg/trackers/kpttrack.yaml")))
+
+    def update(*people, conf=0.9):
+        """Update the tracker with these keypoints, detected at `conf`; return {detection index: track ID}."""
+        kpts = np.stack([np.c_[p, np.full(17, 0.9, dtype=np.float32)] for p in people])
+        boxes = np.c_[
+            kpts[..., :2].min(1), kpts[..., :2].max(1), np.broadcast_to(conf, len(kpts)), np.zeros(len(kpts))
+        ]
+        tracks = tracker.update(Boxes(boxes, (640, 1280)), kpts=kpts)  # rows are [x1, y1, x2, y2, id, score, cls, idx]
+        return {int(t[7]): int(t[4]) for t in tracks}
+
+    def walker(i, start, step):
+        return standing + [start + step * i, 0]
+
+    for i in range(10):
+        first = update(walker(i, -200, 3), walker(i, 200, -3))
+    for i in range(10, 20):  # the second person hidden for 10 frames
+        update(walker(i, -200, 3))
+    assert update(walker(20, -200, 3), walker(20, 200, -3)) == first and len(set(first.values())) == 2
+    assert update(walker(21, 200, -3), walker(21, -200, 3)) == {0: first[1], 1: first[0]}  # idx follows the input
+    assert update(walker(22, -200, 3)[COCO_FLIP], walker(22, 200, -3)) == first  # flipped left-right, same IDs
+    for i in (23, 24):  # the first person detected twice: the less confident copy never starts a track
+        ids = update(walker(i, -200, 3), walker(i, 200, -3), walker(i, -200, 3) + 4, conf=[0.9, 0.9, 0.6])
+    assert ids == first
+
+    tracker.reset()  # keypoints without confidence (e.g. tiger-pose): all seen
+    boxes = Boxes(np.array([[0, 0, 100, 50, 0.9, 0]], dtype=np.float32), (640, 1280))
+    kpts = np.random.default_rng(0).uniform(0, 50, (1, 12, 2)).astype(np.float32)
+    assert [tracker.update(boxes, kpts=kpts)[:, 4].tolist() for _ in range(3)] == [[], [1.0], [1.0]]
+
+    with pytest.raises(ValueError):
+        tracker.update(Boxes(np.zeros((0, 6)), (640, 1280)))  # no keypoints
+    with pytest.raises(ValueError):
+        TRACKER_MAP["kpttrack"].setup_predictor(SimpleNamespace(args=SimpleNamespace(task="detect")))
+
+
 @pytest.mark.parametrize("tracker_type", ["botsort", "deepocsort", "tracktrack"])
 def test_track_reid_auto_user_detections(tracker_type):
     """Native ReID (model='auto') must degrade to motion-only with user-supplied detections, not encode the raw frame."""
@@ -714,6 +764,8 @@ def test_track_stream(model, tmp_path, solution_assets):
 
     # Default end-to-end run for all built-in trackers
     for tracker_type in TRACKER_MAP:
+        if tracker_type == "kpttrack" and model.task != "pose":  # matches keypoints, pose models only
+            continue
         kwargs = {"save_frames": True} if tracker_type == "botsort" else {}
         model.track(video_url, imgsz=160, tracker=f"{tracker_type}.yaml", **kwargs)
 
